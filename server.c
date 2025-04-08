@@ -58,16 +58,16 @@ void addNewClient(int* socket){
 void* clientHandler(void* args){
   int client_socket = *(int*) args;
   free(args);
-  char* buffer[BUFFER_SIZE];
+  char* message_buffer[BUFFER_SIZE];
   char* login_buffer[LOGIN_SIZE];
-  char* buffer_server;
+  char* server_response_buffer;
 
   //ask for user login
   buffer_server = strdup("Insert your login.");
-  send(client_socket, &buffer_server, sizeof(buffer_server), 0);
+  send(client_socket, &server_response_buffer, sizeof(server_response_buffer), 0);
   
   //get a login
-  int bytes_read = recv(client_socket, &login_buffer, sizeof(buffer), 0);
+  int bytes_read = recv(client_socket, &login_buffer, sizeof(login_buffer), 0);
   if(bytes_read <= 0){
     printf("Client disconnected. \n");
     close(client_socket);
@@ -75,18 +75,21 @@ void* clientHandler(void* args){
     return NULL;
   }
   for(int i = 0; i < num_of_clients; i++){
-    if(strcmp(client_list[i]->login, login_buffer)){
-      buffer_server = strdup("Client with given login already connected. Disconnecting...");
-      send(
+    //check if user with given login isn't already connected, if so disconnect
+    if(!strcmp(client_list[i]->login, login_buffer)){
+      server_response_buffer = strdup("Client with given login already connected. Disconnecting...");
+      send(client_socket, &server_response_buffer, sizeof(server_response_buffer), 0);
+      close(client_socket);
+      remove_client(client_socket);
+      return NULL;
     }
   }
-  //aks who he wants to write to (login)
-  //wait for client to write the message
-  //create a new message (from, to, body)
-  //add the message to queue
+  //aks who user wants to write to (login)
   while(1){
-    send(client_socket, &buffer, sizeof(buffer), 0);
-    int bytes_read = recv(client_socket, &buffer, sizeof(buffer), 0);
+    server_response_buffer = strdup("Insert login of a person who you want to send a message to: \n");
+    send(client_socket, &server_response_buffer, sizeof(server_response_buffer), 0);
+    //wait for client to write the message
+    int bytes_read = recv(client_socket, &login_buffer, sizeof(login_buffer), 0);
     if(bytes_read <= 0){
       printf("Client disconnected. \n");
       close(client_socket);
@@ -94,6 +97,18 @@ void* clientHandler(void* args){
       break;
     }
 
+    //check if user login given by client is connected
+    int i;
+    for(i = 0; i < num_of_clients; i++){
+      //if found
+      if(!strcmp(client_list[i]->login, login_buffer)){
+        server_response_buffer = strdup("Insert a message you want to send: \n");
+        send(client_socket, &server_response_buffer, sizeof(server_response_buffer), 0);
+      }
+    }
+      
+      //create a new message (from, to, body)
+      //add the message to queue
   }
   return NULL;
 }
