@@ -12,23 +12,23 @@
 #define SERVER_PORT 7992
 #define BUFFER_SIZE 4096
 
-// Struktura przechowująca informacje o połączeniu
+// struct that keeps information about current connection
 typedef struct
 {
     int socket_fd;
     bool running;
 } connection_info;
 
-// Globalne zmienne
+// global vars:
 connection_info conn = {-1, true};
 pthread_t receive_thread_id;
 
-// Prototypy funkcji
+// funciton prototypes
 void *receive_messages(void *arg);
 void handle_signal(int sig);
 void cleanup_resources();
 
-// Obsługa sygnałów (CTRL+C)
+// handling signals ( killing the app)
 void handle_signal(int sig)
 {
     printf("\nPrzerwanie działania klienta...\n");
@@ -37,7 +37,7 @@ void handle_signal(int sig)
     exit(0);
 }
 
-// Funkcja zwalniająca zasoby
+// free the resources
 void cleanup_resources()
 {
     if (conn.socket_fd != -1)
@@ -47,7 +47,7 @@ void cleanup_resources()
     }
 }
 
-// Wątek odbierający wiadomości od serwera
+// thread that recives messages from the server
 void *receive_messages(void *arg)
 {
     connection_info *connection = (connection_info *)arg;
@@ -69,7 +69,7 @@ void *receive_messages(void *arg)
         }
         else
         {
-            // Wyświetl otrzymaną wiadomość
+            // print recived message
             printf("%s", buffer);
             fflush(stdout);
         }
@@ -80,7 +80,6 @@ void *receive_messages(void *arg)
 
 int main(int argc, char *argv[])
 {
-    // Obsługa argumentów linii poleceń
     char *server_ip = SERVER_IP;
     int server_port = SERVER_PORT;
 
@@ -94,10 +93,9 @@ int main(int argc, char *argv[])
         server_port = atoi(argv[2]);
     }
 
-    // Ustawienie obsługi sygnałów
     signal(SIGINT, handle_signal);
 
-    // Utworzenie gniazda
+    // create socket
     conn.socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (conn.socket_fd < 0)
     {
@@ -105,7 +103,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Konfiguracja adresu serwera
+    // config addr
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -118,7 +116,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Nawiązanie połączenia z serwerem
+    // connect to the server
     printf("Łączenie z serwerem %s:%d...\n", server_ip, server_port);
     if (connect(conn.socket_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
     {
@@ -129,7 +127,7 @@ int main(int argc, char *argv[])
 
     printf("Połączono z serwerem!\n");
 
-    // Utworzenie wątku do odbierania wiadomości
+    // create reciving thread
     if (pthread_create(&receive_thread_id, NULL, receive_messages, &conn) != 0)
     {
         perror("Nie można utworzyć wątku odbierającego");
@@ -139,33 +137,33 @@ int main(int argc, char *argv[])
 
     char input[BUFFER_SIZE];
 
-    // Główna pętla klienta
+    // main client loop
     while (conn.running)
     {
-        // Oczekiwanie na wejście użytkownika
+        // wait for input
         if (fgets(input, BUFFER_SIZE, stdin) == NULL)
         {
             break;
         }
 
-        // Wysłanie wiadomości do serwera
+        // send message to server
         if (send(conn.socket_fd, input, strlen(input), 0) < 0)
         {
             perror("Błąd wysyłania danych");
             break;
         }
 
-        // Sprawdzenie, czy użytkownik chce zakończyć
+        // check if client wants to disconnect
         if (strlen(input) == 2 && input[0] == 'q' && input[1] == '\n')
         {
             printf("Trwa zamykanie klienta...\n");
-            sleep(1); // Daj serwerowi czas na przetworzenie zamknięcia
+            sleep(1); // give server time to handle the disconnection
             conn.running = false;
             break;
         }
     }
 
-    // Oczekiwanie na zakończenie wątku odbierającego
+    // wait for the reciving thread to end
     if (conn.running == false)
     {
         pthread_join(receive_thread_id, NULL);

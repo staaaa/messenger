@@ -13,47 +13,60 @@
 #define BUFFER_SIZE 4096
 #define LOGIN_SIZE 256
 
-// Struktura wiadomości do kolejki
+// queue message struct
 struct entry
 {
   char *from_login;
   char *to_login;
   char *message;
+  // STAILQ - single tail queue (with pointer to tail)
   STAILQ_ENTRY(entry)
   entries;
 };
 
-// Definicja głowy kolejki
+// definition of queue head
 STAILQ_HEAD(stailhead, entry);
 
-// Struktura klienta
+// client struct (that is kept in a arr)
 struct client
 {
   int socket;
   char login[LOGIN_SIZE];
   bool is_logged_in;
+  // every client has it's own message queue - for delivering message later after
+  // they logged out
   struct stailhead queue;
 };
 
-// Lista klientów i liczba klientów
+// array of clients
 struct client *client_list[MAX_CLIENTS];
 int num_of_clients = 0;
+
+// global message queue for all messages
 struct stailhead message_queue;
 
-// Mutexy do synchronizacji dostępu
-pthread_mutex_t mutex_cl = PTHREAD_MUTEX_INITIALIZER; // Mutex dla listy klientów
-pthread_mutex_t mutex_mq = PTHREAD_MUTEX_INITIALIZER; // Mutex dla kolejki wiadomości
-pthread_cond_t cond_mq = PTHREAD_COND_INITIALIZER;    // Warunek dla kolejki wiadomości
+pthread_mutex_t mutex_cl = PTHREAD_MUTEX_INITIALIZER; // mutex for client list
+pthread_mutex_t mutex_mq = PTHREAD_MUTEX_INITIALIZER; // mutex for message queue
+pthread_cond_t cond_mq = PTHREAD_COND_INITIALIZER;    // condition for message queue
 
-// Flaga zakończenia programu
+// flag that indicates if server is still running
 volatile bool server_running = true;
 
-// Funkcja usuwająca klienta z listy
+// Function for handling kill signals
+void handle_signal(int sig)
+{
+  printf("\nPrzerwanie działania klienta...\n");
+  server_running = false;
+  cleanup();
+  exit(0);
+}
+
+// Function that removes client from clientlist
 void removeClient(struct client *client)
 {
   pthread_mutex_lock(&mutex_cl);
 
-  // Szukaj klienta w liście
+  // find client in list
   int index = -1;
   for (int i = 0; i < num_of_clients; i++)
   {
@@ -66,7 +79,7 @@ void removeClient(struct client *client)
 
   if (index != -1)
   {
-    // Przesuń wszystkich klientów o jeden w dół
+    // move all clients (after the found one) one space up in list
     for (int i = index; i < num_of_clients - 1; i++)
     {
       client_list[i] = client_list[i + 1];
@@ -75,14 +88,14 @@ void removeClient(struct client *client)
     printf("Klient '%s' został usunięty. Liczba aktywnych klientów: %d\n", client->login, num_of_clients);
   }
 
-  // Zamknij socket i zwolnij pamięć
+  // close socket, free memory
   close(client->socket);
   free(client);
 
   pthread_mutex_unlock(&mutex_cl);
 }
 
-// Funckja wylogowująca klienta z listy
+// Function that logs out client (sets its logged = false)
 void logoutClient(struct client *client)
 {
   pthread_mutex_lock(&mutex_cl);
@@ -102,12 +115,10 @@ void logoutClient(struct client *client)
     printf("Klient '%s' został rozłączony.\n", client->login);
   }
   close(client->socket);
-  // free(client);
-
   pthread_mutex_unlock(&mutex_cl);
 }
 
-// Funkcja znajdująca klienta po loginie
+// Function that finds a client with given login, returns the pointer to that client
 struct client *findClientByLogin(const char *login)
 {
   pthread_mutex_lock(&mutex_cl);
@@ -124,9 +135,13 @@ struct client *findClientByLogin(const char *login)
   return found;
 }
 
-// Funkcja dodająca wiadomość do kolejki
+// Function that adds a message to global queue
+// every user whenever sends a new message, its being added to global message queue
+// whenever it happens, the condition for messagequeue is set to true, and then server
+// sents all messages in queue periodicly
 void addMessageToQueue(const char *from_login, const char *to_login, const char *message)
 {
+  // allocate memory for new message
   struct entry *new_entry = (struct entry *)malloc(sizeof(struct entry));
   if (!new_entry)
   {
@@ -134,37 +149,43 @@ void addMessageToQueue(const char *from_login, const char *to_login, const char 
     return;
   }
 
+  // set values of message fields
   new_entry->from_login = strdup(from_login);
   new_entry->to_login = strdup(to_login);
   new_entry->message = strdup(message);
 
   struct client *client_to = findClientByLogin(to_login);
+  // if client isn't logged in right now, add the message to personal queue to be sent later
   if (!client_to->is_logged_in)
   {
     STAILQ_INSERT_TAIL(&client_to->queue, new_entry, entries);
     return;
   }
 
+  // else if client is logged currently, add the new message to the global messege queue
   pthread_mutex_lock(&mutex_mq);
   STAILQ_INSERT_TAIL(&message_queue, new_entry, entries);
-  pthread_cond_signal(&cond_mq); // Sygnalizuj, że nowa wiadomość jest dostępna
+  pthread_cond_signal(&cond_mq); // signal that new message is in queue and should be sent out
   pthread_mutex_unlock(&mutex_mq);
 }
 
-// Funkcja dostarczajaca zalegle wiadomosci
+// Function that delivers messages that are waiting in the personal queues
 void deliverPastMessages(struct client *client)
 {
+  // while queue is not empty
   while (!STAILQ_EMPTY(&client->queue))
   {
+    // pop the message from the personal queue to the global queue (to be sent)
     struct entry *message = STAILQ_FIRST(&client->queue);
     addMessageToQueue(message->from_login, message->to_login, message->message);
     STAILQ_REMOVE_HEAD(&client->queue, entries);
   }
 }
 
-// Funkcja dodająca nowego klienta
-bool addNewClient(int *client_socket, struct client **new_client)
+// Function that handles loggin in
+bool handleLoggingIn(int *client_socket, struct client **new_client)
 {
+  // check if server isn't full
   if (num_of_clients >= MAX_CLIENTS)
   {
     printf("BŁĄD: Osiągnięto maksymalną liczbę klientów\n");
@@ -175,7 +196,7 @@ bool addNewClient(int *client_socket, struct client **new_client)
   }
   else
   {
-    // Alokacja struktury klienta
+    // allocate client struct
     struct client *cl = (struct client *)malloc(sizeof(struct client));
     if (!cl)
     {
@@ -185,11 +206,12 @@ bool addNewClient(int *client_socket, struct client **new_client)
       return false;
     }
 
+    // set client values
     cl->socket = *client_socket;
     cl->is_logged_in = false;
     memset(cl->login, 0, LOGIN_SIZE);
 
-    // Poproś o login
+    // ask for login
     const char *login_prompt = "Podaj swój login: ";
     send(*client_socket, login_prompt, strlen(login_prompt), 0);
 
@@ -204,17 +226,18 @@ bool addNewClient(int *client_socket, struct client **new_client)
     }
 
     login_buffer[bytes_read] = '\0';
-    // Usuń znak nowej linii, jeśli istnieje
+    // delete newline if exists
     char *newline = strchr(login_buffer, '\n');
     if (newline)
       *newline = '\0';
 
-    // Sprawdź, czy użytkownik o podanym loginie już istnieje
+    // check if user with given login already exist
     struct client *client = findClientByLogin(login_buffer);
-    // Jesli istnieje
+    // if exist
     if (client != NULL)
     {
-      // Jesli jest zalogowany juz ktos na ten login
+      // check if this user is currently logged in
+      // if so deny new connection
       if (client->is_logged_in)
       {
         printf("Klient %s jest juz zalogowany. Odmowa nowego logowania na ten login.\n", client->login);
@@ -222,15 +245,16 @@ bool addNewClient(int *client_socket, struct client **new_client)
         free(cl);
         return false;
       }
-      // Jesli nikt nie jest obecnie zalgoowany na ten login
+      // if noone is logged in on that account, log this user onto that account
       else
       {
         pthread_mutex_lock(&mutex_cl);
         client->is_logged_in = true;
+        // change the previously saved socket to the new one
         client->socket = cl->socket;
         pthread_mutex_unlock(&mutex_cl);
 
-        // Ustawiamy *new_client na istniejącego klienta, aby wywołujący mógł poprawnie z niego korzystać
+        // set the new_client pointer to the current client
         *new_client = client;
 
         char *msg = "Pomyślnie zalogowano!\n";
@@ -239,7 +263,7 @@ bool addNewClient(int *client_socket, struct client **new_client)
         return true;
       }
     }
-    // Jeśli login jest unikalny, dodaj klienta do listy
+    // if login is unique, add the new user to the queue
     strncpy(cl->login, login_buffer, LOGIN_SIZE - 1);
     cl->is_logged_in = true;
     STAILQ_INIT(&cl->queue);
@@ -247,6 +271,7 @@ bool addNewClient(int *client_socket, struct client **new_client)
     num_of_clients++;
     *new_client = cl;
 
+    // send init message to client
     printf("Nowy klient zalogowany jako '%s'. Aktywni klienci: %d\n", cl->login, num_of_clients);
 
     const char *welcome_msg = "Pomyślnie zalogowano! Dostępne komendy:\n"
@@ -258,17 +283,17 @@ bool addNewClient(int *client_socket, struct client **new_client)
   }
 }
 
-// Wątek obsługi klienta
+// thread client handler
 void *clientHandler(void *args)
 {
-  // Sparsuj argument i utworz lokalnego klienta
+  // parse arg to client struct
   struct client *client = (struct client *)args;
   char buffer[BUFFER_SIZE];
   bool running = true;
 
   while (running && server_running)
   {
-    // wyzeruj bufor i oczekuj komendy od klienta
+    // clear buffer and wait for input from client
     memset(buffer, 0, BUFFER_SIZE);
     int bytes_read = recv(client->socket, buffer, BUFFER_SIZE - 1, 0);
 
@@ -280,19 +305,19 @@ void *clientHandler(void *args)
     }
 
     buffer[bytes_read] = '\0';
-    // Usuń znak nowej linii, jeśli istnieje
+    // delete newline if exists
     char *newline = strchr(buffer, '\n');
     if (newline)
       *newline = '\0';
 
-    // Parsowanie komendy - message
+    // parse command - message
+    // m <login> <message>
     if (buffer[0] == 'm' && buffer[1] == ' ')
     {
-      // Komenda wysłania wiadomości: m <login> <wiadomość>
       char to_login[LOGIN_SIZE] = {0};
       char message[BUFFER_SIZE] = {0};
 
-      // Znajdź pierwszy odstęp po 'm '
+      // find first space after m
       char *space_after_command = strchr(buffer + 2, ' ');
       if (!space_after_command)
       {
@@ -301,7 +326,7 @@ void *clientHandler(void *args)
         continue;
       }
 
-      // Wyodrębnij login (wszystko między 'm ' a następnym spacją)
+      // extract login
       int login_len = space_after_command - (buffer + 2);
       if (login_len >= LOGIN_SIZE || login_len <= 0)
       {
@@ -312,10 +337,10 @@ void *clientHandler(void *args)
       strncpy(to_login, buffer + 2, login_len);
       to_login[login_len] = '\0';
 
-      // Wyodrębnij wiadomość (wszystko po loginie)
+      // extract message
       strncpy(message, space_after_command + 1, BUFFER_SIZE - 1);
 
-      // Sprawdź, czy odbiorca istnieje
+      // check if recipient exists
       struct client *recipient = findClientByLogin(to_login);
       if (!recipient)
       {
@@ -325,23 +350,24 @@ void *clientHandler(void *args)
       }
       else
       {
-        // Dodaj wiadomość do kolejki
+        // add message to queue
         addMessageToQueue(client->login, to_login, message);
         const char *confirm_msg = "Wiadomość została dodana do kolejki\n";
         send(client->socket, confirm_msg, strlen(confirm_msg), 0);
       }
     }
-    // Parsowanie komendy - q
+    // parse command, quit
+    // quit logs user out
     else if (strcmp(buffer, "q") == 0)
     {
-      // Komenda wylogowania
       const char *logout_msg = "Wylogowywanie...\n";
       send(client->socket, logout_msg, strlen(logout_msg), 0);
       running = false;
     }
+    // parse command, list
+    //  sents logged user list to user
     else if (strcmp(buffer, "l") == 0)
     {
-      // Komenda wyświetlenia listy zalogowanych użytkowników
       char users_list[BUFFER_SIZE] = "Zalogowani użytkownicy:\n";
       pthread_mutex_lock(&mutex_cl);
       for (int i = 0; i < num_of_clients; i++)
@@ -358,7 +384,7 @@ void *clientHandler(void *args)
     }
     else
     {
-      // Nieznana komenda
+      // handling parsing error
       const char *help_msg = "Nieznana komenda. Dostępne komendy:\n"
                              " m <login> <wiadomość> : wyślij wiadomość do użytkownika\n"
                              " l : lista zalogowanych użytkowników\n"
@@ -371,7 +397,7 @@ void *clientHandler(void *args)
   return NULL;
 }
 
-// Wątek wysyłający wiadomości z kolejki
+// thread that is delivering messages from queue
 void *messageDeliveryThread(void *args)
 {
   while (server_running)
@@ -381,30 +407,30 @@ void *messageDeliveryThread(void *args)
     pthread_mutex_lock(&mutex_mq);
     while (STAILQ_EMPTY(&message_queue) && server_running)
     {
-      // Czekaj na sygnał o nowej wiadomości lub zakończeniu serwera
-      // Czekanie na sygnał automatycznie zwalnia mutex_mq do momentu pojawienia sie sygnalu
-      // O nowej wiadomości
+      // wait for signal about new message or wait for server to stop running
+      // reciving the cond_mq automaticlly releases the mutex_mq
       pthread_cond_wait(&cond_mq, &mutex_mq);
     }
 
+    // if server closes release mutex
     if (!server_running)
     {
       pthread_mutex_unlock(&mutex_mq);
       break;
     }
 
-    // Pobierz pierwszą wiadomość z kolejki
+    // get the first message in queue
     message = STAILQ_FIRST(&message_queue);
     STAILQ_REMOVE_HEAD(&message_queue, entries);
     pthread_mutex_unlock(&mutex_mq);
 
     if (message)
     {
-      // Znajdź odbiorcę wiadomości
+      // find recipient
       struct client *recipient = findClientByLogin(message->to_login);
       if (recipient)
       {
-        // Sformatuj i wyślij wiadomość
+        // format message and send
         char formatted_message[BUFFER_SIZE];
         snprintf(formatted_message, BUFFER_SIZE, "Wiadomość od %s: %s\n",
                  message->from_login, message->message);
@@ -412,7 +438,7 @@ void *messageDeliveryThread(void *args)
         send(recipient->socket, formatted_message, strlen(formatted_message), 0);
         printf("Dostarczono wiadomość od '%s' do '%s'\n", message->from_login, message->to_login);
       }
-      // Zwolnij pamięć zajmowaną przez wiadomość
+      // free memory
       free(message->from_login);
       free(message->to_login);
       free(message->message);
@@ -422,16 +448,16 @@ void *messageDeliveryThread(void *args)
   return NULL;
 }
 
-// Obsługa sygnału zakończenia programu
+// handling the program cleanup
 void cleanup()
 {
   printf("Zamykanie serwera...\n");
   server_running = false;
 
-  // Sygnalizuj wątek obsługujący wiadomości, aby zakończył pracę
+  // signal to the message thread that he needs to end his work gracefully
   pthread_cond_signal(&cond_mq);
 
-  // Zamknij wszystkie połączenia klientów
+  // close all connections
   pthread_mutex_lock(&mutex_cl);
   for (int i = 0; i < num_of_clients; i++)
   {
@@ -446,7 +472,7 @@ void cleanup()
   num_of_clients = 0;
   pthread_mutex_unlock(&mutex_cl);
 
-  // Zwolnij elementy pozostałe w kolejce wiadomości
+  // free all elements in memory
   pthread_mutex_lock(&mutex_mq);
   struct entry *entry;
   while (!STAILQ_EMPTY(&message_queue))
@@ -463,10 +489,13 @@ void cleanup()
 
 int main()
 {
-  // Inicjalizacja kolejki wiadomości
+  // init message queue
   STAILQ_INIT(&message_queue);
 
-  // Utworzenie socketu serwera
+  // bind the handle_signal method to signals
+  signal(SIGINT, handle_signal);
+
+  // create server socket
   int server_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (server_socket < 0)
   {
@@ -474,7 +503,7 @@ int main()
     exit(1);
   }
 
-  // Ustawienie opcji socketu dla szybkiego ponownego użycia adresu i portu
+  // set socket options
   int opt = 1;
   if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
   {
@@ -483,14 +512,14 @@ int main()
     exit(1);
   }
 
-  // Konfiguracja adresu serwera
+  // configure server
   struct sockaddr_in server_addr;
   memset(&server_addr, 0, sizeof(server_addr));
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(PORT);
   server_addr.sin_addr.s_addr = INADDR_ANY;
 
-  // Powiązanie socketu z adresem
+  // bind socket to addr
   if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
   {
     perror("Nie można powiązać socketu z adresem");
@@ -498,7 +527,7 @@ int main()
     exit(1);
   }
 
-  // Nasłuchiwanie na połączenia
+  // listen for connections
   if (listen(server_socket, 5) < 0)
   {
     perror("Błąd podczas nasłuchiwania");
@@ -508,7 +537,7 @@ int main()
 
   printf("Serwer uruchomiony i nasłuchuje na porcie: %d...\n", PORT);
 
-  // Uruchomienie wątku dostarczającego wiadomości
+  // start the delivery thread
   pthread_t delivery_thread;
   if (pthread_create(&delivery_thread, NULL, messageDeliveryThread, NULL) != 0)
   {
@@ -517,13 +546,13 @@ int main()
     exit(1);
   }
 
-  // Pętla akceptująca połączenia
+  // loop that is constantly listening for connection
   while (server_running)
   {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
-    // Akceptuj nowe połączenie
+    // accept new connection
     int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
     if (client_socket < 0)
     {
@@ -534,14 +563,14 @@ int main()
       continue;
     }
 
-    // Wypisz informacje o nowym połączeniu
+    // write information about new connection
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
     printf("Nowe połączenie z %s:%d\n", client_ip, ntohs(client_addr.sin_port));
 
-    // Dodaj klienta i utwórz wątek obsługujący
+    // create new client and create new client handling thread
     struct client *new_client = NULL;
-    if (addNewClient(&client_socket, &new_client))
+    if (handleLoggingIn(&client_socket, &new_client))
     {
       pthread_t client_thread;
       if (pthread_create(&client_thread, NULL, clientHandler, new_client) != 0)
@@ -554,17 +583,16 @@ int main()
     }
   }
 
-  // Poczekaj na zakończenie wątku dostarczającego wiadomości
   pthread_join(delivery_thread, NULL);
 
-  // Zamknij socket serwera
+  // close server socket
   close(server_socket);
 
-  // Zniszcz mutexy i zmienną warunkową
   pthread_mutex_destroy(&mutex_cl);
   pthread_mutex_destroy(&mutex_mq);
   pthread_cond_destroy(&cond_mq);
 
+  cleanup();
   printf("Serwer zakończył działanie\n");
   return 0;
 }
